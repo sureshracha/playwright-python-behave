@@ -1,0 +1,4 @@
+[tool.behave.formatters]
+allure = "allure_behave.formatter:AllureFormatter"
+html   = "behave_html_formatter:HTMLFormatter"
+html-pretty = "behave_html_pretty_formatter:PrettyHTMLFormatter"

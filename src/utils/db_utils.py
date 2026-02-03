@@ -1,117 +1,205 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import List, Union, Optional
+from typing import Any, Dict, List, Optional, Sequence, Union
 
 
-def add_no_of_days(dt: datetime, days: int) -> datetime:
-    """Add N days to a datetime (like JS setDate(getDate()+days))."""
-    return dt + timedelta(days=days)
-
-
-def subtract_no_of_days(dt: datetime, days: int) -> datetime:
-    """Subtract N days from a datetime."""
-    return dt - timedelta(days=days)
-
-
-def get_dates(start_date: datetime, stop_date: datetime) -> List[datetime]:
+class DataBaseUtils:
     """
-    Return list of datetimes from start_date to stop_date inclusive.
-    Mirrors TS while(currentDate <= stopDate) with +1 day steps.
+    Python rewrite of the TS DataBaseUtils.
+
+    - db_type: "oracle" | "mysql" | "sql"
+    - db_config: dict-like configuration, depends on driver.
+    - query_result: dict containing:
+        - rows: list of row tuples
+        - metaData: list of dicts with at least {"name": <colname>}
+        - json: list[dict] (only when casesync=False for Oracle, like TS)
     """
-    date_array: List[datetime] = []
-    current = start_date
 
-    while current <= stop_date:
-        # Create a "copy" like new Date(currentDate)
-        date_array.append(datetime.fromtimestamp(current.timestamp()))
-        current = add_no_of_days(current, 1)
+    def __init__(self, db_type: str, db_config: Optional[Dict[str, Any]] = None):
+        self.db_conn: Any = None  # underlying connection object
+        self.conn: Any = None     # kept for parity with TS; not strictly required
+        self.db_type: str = db_type
+        self.db_config: Dict[str, Any] = db_config or {}
+        self.query_result: Optional[Dict[str, Any]] = None
 
-    return date_array
+    def set_db_type(self, db_type: str) -> None:
+        self.db_type = db_type
 
+    def set_config(self, db_config: Dict[str, Any]) -> None:
+        self.db_config = db_config
 
-def get_mmddyyyy_format(dt: datetime) -> str:
-    """Format as MM/DD/YYYY."""
-    return dt.strftime("%m/%d/%Y")
+    def execute_select_cmd(
+        self,
+        query: str,
+        params: Optional[Union[Sequence[Any], Dict[str, Any]]] = None,
+        *,
+        casesync: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Execute a SELECT query and return a query_result dict.
 
+        Args:
+            query: SQL query string
+            params: optional bind params (tuple/list for positional or dict for named)
+            casesync: if False, also populate query_result["json"] (Oracle behavior parity)
 
-def get_mmddyyyy_format_with_hyphen(dt: datetime) -> str:
-    """Format as MM-DD-YYYY."""
-    return dt.strftime("%m-%d-%Y")
+        Returns:
+            query_result dict with "rows", "metaData", and possibly "json".
+        """
+        dbt = (self.db_type or "").lower().strip()
 
+        if dbt == "oracle":
+            return self._execute_oracle_select(query, params=params, casesync=casesync)
 
-def get_system_datetime_mmddyyyy_hhmm_format(now: Optional[datetime] = None) -> str:
-    """
-    Format current system time as: MM/DD/YYYY HH:MM AM/PM
-    Matches your TS logic (12-hour clock with AM/PM).
-    """
-    now = now or datetime.now()
-    return now.strftime("%m/%d/%Y %I:%M %p")
+        if dbt == "mysql":
+            return self._execute_mysql_select(query, params=params)
 
+        if dbt == "sql":
+            # Your TS class constructor allows "sql" but code doesn't implement it.
+            # You can implement using pyodbc or pymssql if needed.
+            raise NotImplementedError(
+                "db_type='sql' is not implemented. "
+                "Use pyodbc/pymssql and add a _execute_sqlserver_select method."
+            )
 
-def get_system_datetime_yyyymmdd_hhmm_format(
-    date_value: Union[str, int, float, datetime, None] = None
-) -> str:
-    """
-    Format as: YYYY-MM-DDTHH:MM (24-hour clock)
-    TS version accepts string|number|Date and uses new Date(date) or new Date().
-    
-    Python parsing notes:
-      - datetime -> used directly
-      - None or "" -> now
-      - int/float -> treated as Unix seconds
-      - str -> ISO-ish strings work best (e.g., "2026-01-30T10:15:00")
-    """
-    if date_value is None or date_value == "":
-        dt = datetime.now()
-    elif isinstance(date_value, datetime):
-        dt = date_value
-    elif isinstance(date_value, (int, float)):
-        dt = datetime.fromtimestamp(date_value)
-    elif isinstance(date_value, str):
-        # Try ISO parse first
+        raise ValueError(f"Unsupported db_type: {self.db_type!r}")
+
+    # -----------------------------
+    # Oracle implementation
+    # -----------------------------
+    def _execute_oracle_select(
+        self,
+        query: str,
+        params: Optional[Union[Sequence[Any], Dict[str, Any]]] = None,
+        *,
+        casesync: bool,
+    ) -> Dict[str, Any]:
+        """
+        Oracle select using python-oracledb.
+
+        Expected db_config keys commonly include:
+            user, password, dsn
+        Optional:
+            config_dir, wallet_location, wallet_password, etc.
+        """
         try:
-            dt = datetime.fromisoformat(date_value)
-        except ValueError:
-            # Fallback: attempt common formats (extend if you need more)
-            for fmt in ("%m/%d/%Y %H:%M", "%m/%d/%Y", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-                try:
-                    dt = datetime.strptime(date_value, fmt)
-                    break
-                except ValueError:
-                    dt = None
-            if dt is None:
-                raise ValueError(f"Unrecognized date string format: {date_value!r}")
-    else:
-        raise TypeError(f"Unsupported type for date_value: {type(date_value)}")
+            import oracledb  # python-oracledb
+        except ImportError as e:
+            raise ImportError(
+                "Missing dependency: 'oracledb'. Install with: pip install oracledb"
+            ) from e
 
-    return dt.strftime("%Y-%m-%dT%H:%M")
+        conn = None
+        cur = None
+        try:
+            conn = oracledb.connect(**self.db_config)
+            cur = conn.cursor()
+            if params is None:
+                cur.execute(query)
+            else:
+                cur.execute(query, params)
 
+            rows = cur.fetchall()
+            # cur.description is list of tuples: (name, type_code, display_size, internal_size, precision, scale, null_ok)
+            meta = [{"name": d[0]} for d in (cur.description or [])]
 
-def calculate_age(dob: str, today: Optional[datetime] = None) -> int:
-    """
-    Calculate age in years from date-of-birth string.
-    Mirrors TS logic: subtract years and adjust if birthday not yet occurred.
-    
-    Accepts ISO-like dob strings best: "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS".
-    """
-    # Prefer ISO; fallback to common formats
-    try:
-        birth = datetime.fromisoformat(dob)
-    except ValueError:
-        for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+            self.query_result = {
+                "rows": rows,
+                "metaData": meta,
+            }
+
+            # Match your TS behavior: build JSON unless casesync is True
+            if not casesync:
+                self.query_result["json"] = self._results_to_json(rows, meta)
+
+            return self.query_result
+
+        except Exception as err:
+            # Match the "Ouch!" console log vibe but raise for caller visibility
+            print("Ouch!", err)
+            raise
+        finally:
+            # Always clean up
             try:
-                birth = datetime.strptime(dob, fmt)
-                break
-            except ValueError:
-                birth = None
-        if birth is None:
-            raise ValueError(f"Unrecognized DOB format: {dob!r}")
+                if cur is not None:
+                    cur.close()
+            finally:
+                if conn is not None:
+                    conn.close()
 
-    today = today or datetime.now()
+    # -----------------------------
+    # MySQL implementation
+    # -----------------------------
+    def _execute_mysql_select(
+        self,
+        query: str,
+        params: Optional[Union[Sequence[Any], Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        MySQL select using mysql-connector-python.
 
-    age = today.year - birth.year
-    if (today.month, today.day) < (birth.month, birth.day):
-        age -= 1
-    return age
+        Expected db_config keys commonly include:
+            host, user, password, database, port
+        """
+        try:
+            import mysql.connector as mysql_connector  # mysql-connector-python
+        except ImportError:
+            try:
+                import pymysql as mysql_connector  # PyMySQL fallback
+            except ImportError as e:
+                raise ImportError(
+                    "Missing dependency: 'mysql-connector-python' or 'PyMySQL'. "
+                    "Install with: pip install mysql-connector-python pymysql"
+                ) from e
+
+        conn = None
+        cur = None
+        try:
+            conn = mysql.connector.connect(**self.db_config)
+            cur = conn.cursor()
+
+            if params is None:
+                cur.execute(query)
+            else:
+                cur.execute(query, params)
+
+            rows = cur.fetchall()
+            # cursor.description is tuples; name is index 0
+            meta = [{"name": d[0]} for d in (cur.description or [])]
+
+            self.query_result = {
+                "rows": rows,
+                "metaData": meta,
+                # TS mysql path returned rows directly, but we keep consistent structure
+                "json": self._results_to_json(rows, meta),
+            }
+            return self.query_result
+
+        except Exception as err:
+            print("Ouch!", err)
+            raise
+        finally:
+            try:
+                if cur is not None:
+                    cur.close()
+            finally:
+                if conn is not None:
+                    conn.close()
+
+    # -----------------------------
+    # Helper (like getResultsToJson)
+    # -----------------------------
+    def _results_to_json(self, rows: List[tuple], meta_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Convert rows + metaData into list of dicts.
+
+        TS version built JSON via string concatenation + JSON.parse.
+        Python version safely builds dicts directly.
+        """
+        col_names = [m.get("name") for m in meta_data]
+        result: List[Dict[str, Any]] = []
+        for row in rows:
+            item = {col_names[i]: row[i] for i in range(len(col_names))}
+            result.append(item)
+        return result
